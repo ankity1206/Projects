@@ -1,0 +1,16 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=PDFMaster
+GenericName=PDF Tool
+Comment=View, Merge, Compress and Split PDF files — offline, no dependencies
+Exec=pdfmaster %F
+Icon=pdfmaster
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;
+StartupNotify=true
+StartupWMClass=PDFMaster
+Keywords=PDF;view;merge;compress;split;
+X-AppImage-Version=1.0.0
+X-AppImage-Arch=x86_64

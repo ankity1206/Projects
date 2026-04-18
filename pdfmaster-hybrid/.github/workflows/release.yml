@@ -1,0 +1,212 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g. 1.0.0)'
+        required: true
+        default: '1.0.0'
+
+permissions:
+  contents: write   # needed to upload release assets
+
+env:
+  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', inputs.version) }}
+  GO_VERSION: '1.22'
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════════
+  # Linux AppImage
+  # ══════════════════════════════════════════════════════════════════════
+  build-linux:
+    name: Linux AppImage
+    runs-on: ubuntu-22.04   # glibc 2.35 — broad compatibility baseline
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            go/go.sum
+            launcher/go.sum
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libmupdf-dev libqpdf-dev \
+            zlib1g-dev libpng-dev libjpeg-turbo8-dev \
+            libfreetype6-dev libharfbuzz-dev \
+            libglib2.0-dev \
+            rsvg-convert \
+            patchelf \
+            libfuse2   # needed to run AppImage in CI
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: linux-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: linux-go-
+
+      - name: Build AppImage
+        run: |
+          chmod +x packaging/linux/build_appimage.sh
+          ./packaging/linux/build_appimage.sh
+        env:
+          VERSION: ${{ env.VERSION }}
+
+      - name: Smoke test AppImage
+        run: |
+          APPIMAGE=$(ls dist/PDFMaster-*.AppImage)
+          chmod +x "$APPIMAGE"
+          # Run with --version flag (should exit 0 and print version)
+          "$APPIMAGE" --version || true
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: dist/PDFMaster-*.AppImage
+          retention-days: 30
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Windows Installer + Portable ZIP
+  # ══════════════════════════════════════════════════════════════════════
+  build-windows:
+    name: Windows Installer
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            go/go.sum
+            launcher/go.sum
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install CMake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.28'
+
+      - name: Install vcpkg and PDF libraries
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git C:\vcpkg
+          C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          C:\vcpkg\vcpkg.exe install `
+            mupdf:x64-windows-static `
+            qpdf:x64-windows-static `
+            zlib:x64-windows-static `
+            libjpeg-turbo:x64-windows-static `
+            --recurse
+          echo "VCPKG_ROOT=C:\vcpkg" >> $env:GITHUB_ENV
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: windows-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: windows-go-
+
+      - name: Install NSIS
+        run: |
+          choco install nsis --no-progress -y
+
+      - name: Build installer
+        run: |
+          packaging\windows\build_installer.bat
+        shell: cmd
+        env:
+          VCPKG_ROOT: C:\vcpkg
+          VERSION: ${{ env.VERSION }}
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: |
+            dist/PDFMaster-Setup-*.exe
+            dist/PDFMaster-Portable-*.zip
+          retention-days: 30
+
+  # ══════════════════════════════════════════════════════════════════════
+  # GitHub Release — attach all artifacts
+  # ══════════════════════════════════════════════════════════════════════
+  release:
+    name: Create GitHub Release
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-appimage
+          path: release-assets/
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: release-assets/
+
+      - name: Generate checksums
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION="${{ github.ref_name }}"
+          # Extract section from CHANGELOG.md if it exists
+          if [ -f CHANGELOG.md ]; then
+            awk "/^## \[?${VERSION#v}/,/^## /" CHANGELOG.md \
+              | head -n -1 > release_notes.md
+          else
+            echo "Release ${VERSION}" > release_notes.md
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "PDFMaster ${{ github.ref_name }}"
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          files: |
+            release-assets/PDFMaster-*.AppImage
+            release-assets/PDFMaster-Setup-*.exe
+            release-assets/PDFMaster-Portable-*.zip
+            release-assets/SHA256SUMS.txt
+          token: ${{ secrets.GITHUB_TOKEN }}
